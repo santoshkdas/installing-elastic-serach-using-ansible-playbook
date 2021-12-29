@@ -1,0 +1,129 @@
+---
+- name: Provision an EC2 Instance
+  hosts: localhost
+  connection: local
+  become: yes
+  gather_facts: False
+  tags: 
+    - Provisioning
+
+  vars:
+    instance_type: t2.micro
+    security_group: elastic_search
+    image: ami-002068ed284fb165b
+    region: us-east-2
+    keypair: Ansible
+    count: 1
+    subnet_id: subnet-04f0e3122212a7688
+  tasks:
+  - name: Create the secutity group for elastic_search
+    local_action:
+      module: ec2_group
+      name: "{{ security_group }}"
+      description: Security Group for Newly Created EC2 Instance
+      region: "{{ region }}"
+      rules:
+        - proto: tcp
+          from_port: 22
+          to_port: 22
+          cidr_ip: 0.0.0.0/0
+        - proto: tcp
+          from_port: 80
+          to_port: 80
+          cidr_ip: 0.0.0.0/0
+      rules_egress:
+        - proto: all
+          cidr_ip: 0.0.0.0/0
+
+  - name: launch ec2 instance
+    local_action:
+      module: ec2
+      group: "{{ security_group }}"
+      instance_type: "{{ instance_type}}"
+      image: "{{ image }}"
+      wait: yes 
+      region: "{{ region }}"
+      vpc_subnet_id: "{{ subnet_id }}"
+      keypair: "{{ keypair }}"
+      count: "{{count}}"
+      assign_public_ip: yes
+    register: ec2
+  - name: Add the newly created host so that we can further contact it
+    add_host:
+      name: "{{ item.public_ip }}"
+      groups: deploy
+    with_items: "{{ ec2.instances }}"
+
+  - name: Wait for SSH to come up
+    wait_for: 
+      host: "{{ item.public_ip }}"
+      port: 22 
+      state: started
+    with_items: "{{ ec2.instances }}"
+
+  - name: Adding Tags to Identify
+    local_action: ec2_tag resource={{ item.id }} region={{ region }} state=present
+    with_items: "{{ ec2.instances }}"
+    args:
+      tags:
+        Name: elastic_serach_instance
+        Owner: Santosh
+        PurPose: Testing EC2 Instance For elastic_serach
+  - name: accept new ssh fingerprints                                         
+    shell: ssh-keyscan -H {{ item.public_ip }} >> ~/.ssh/known_hosts          
+    with_items: "{{ ec2.instances }}" 
+  - name: Breathing room (Ansible uses python apt, has issues running directly after boot)
+    pause: seconds=5
+- name: Configuring ElasticSearch
+  hosts: deploy
+  user: ec2-user
+  become_method: sudo
+  become: yes
+  gather_facts: false
+  
+  tasks:
+  - name: update cache and ignore_errors
+    become: yes
+    yum: update_cache=yes
+    ignore_errors: yes
+  - name: install nginx
+    become: yes
+    yum:
+      name: nginx
+      state: present
+  - name: install java 11
+    become: yes
+    yum:
+      name: openjdk-11-jdk
+      state: present
+
+  - name: install elasticsearch
+    become: yes
+    yum: 
+      name: elasticsearch
+      purge: yes
+      state: present
+      notify: restart elasticsearch
+
+  - name: Copy over Elasticsearch settings      
+    copy: src=./elasticsearch/elasticsearch.yml dest=/etc/elasticsearch/elasticsearch.yml
+    notify: restart elasticsearch
+
+  - name: Copy over nginx defailt file    
+    copy: src=./elasticsearch/default dest=/etc/nginx/sites-available/default
+    notify: restart nginx
+
+  - name: Copy over chain file      
+    copy: src=./elasticsearch/fullchain.pem dest=/etc/nginx/sites-available/fullchain.pem
+    notify: restart nginx
+
+  - name: Copy over pvt keypair      
+    copy: src=./elasticsearch/privkey.pem dest=/etc/nginx/sites-available/privkey.pem
+    notify: restart nginx
+
+  handlers:
+    - name: restart elasticsearch
+      action: service name=elasticsearch state=restarted
+
+    - name: restart nginx
+      action: service name=nginx state=restarted
